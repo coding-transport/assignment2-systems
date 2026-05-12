@@ -7,7 +7,8 @@ import torch
 def get_flashattention_autograd_function_pytorch() -> type:
     """
     Returns a torch.autograd.Function subclass that implements FlashAttention2.
-    The expectation is that this class will implement FlashAttention2
+    The expectation
+    is that this class will implement FlashAttention2
     using only standard PyTorch operations (no Triton!).
 
     Returns:
