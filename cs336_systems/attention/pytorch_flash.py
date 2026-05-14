@@ -4,122 +4,152 @@ import torch
 class MyFlashAttnAutogradFunctionClass(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale=None, is_causal=False):
-        # 1. 基础维度获取
+    def forward(ctx, q, k, v, is_causal=False, sm_scale=None):
         B, N, D = q.shape
         if sm_scale is None:
             sm_scale = 1.0 / (D ** 0.5)
 
-        # 初始化输出和辅助变量
+        # 1. 核心修正：初始化 m 和 L 为 (B, N, 1)
+        # 这样在计算 (B, Br, D) / (B, Br, 1) 时，维度能完美自动对齐，不会出现广播歧义
         O = torch.zeros_like(q)
-        m = torch.full((B, N), float('-inf'), device=q.device)  # 记录当前的 max
-        L = torch.zeros((B, N), device=q.device)  # 记录当前的 exp 累加和
+        m = torch.full((B, N, 1), float('-inf'), device=q.device)
+        L = torch.zeros((B, N, 1), device=q.device)
 
-        # 分块大小（根据 GPU 显存建议设置，64 是常见选择）
         Br, Bc = 64, 64
         Tr, Tc = (N + Br - 1) // Br, (N + Bc - 1) // Bc
 
-        # 2. 外层循环处理 Key 和 Value 的列分块
         for j in range(Tc):
             start_j, end_j = j * Bc, min((j + 1) * Bc, N)
             kj = k[:, start_j:end_j, :]
             vj = v[:, start_j:end_j, :]
 
-            # 3. 内层循环处理 Query 的行分块
             for i in range(Tr):
-                # 如果是因果掩码，且当前列分块的起点已经超过了行分块的终点，直接跳过
-                if is_causal and (j * Bc > (i + 1) * Br - 1):
+                start_i, end_i = i * Br, min((i + 1) * Br, N)
+
+                # 因果掩码剪枝
+                if is_causal and (start_j >= end_i):
                     continue
 
-                start_i, end_i = i * Br, min((i + 1) * Br, N)
                 qi = q[:, start_i:end_i, :]
                 oi = O[:, start_i:end_i, :]
                 mi = m[:, start_i:end_i, :]
                 li = L[:, start_i:end_i, :]
 
-                # 计算注意力分数 S = Q * K.T * scale
-                # (B, H, Br, D) @ (B, H, D, Bc) -> (B, H, Br, Bc)
+                # 计算注意力分数
                 S_ij = torch.matmul(qi, kj.transpose(-2, -1)) * sm_scale
-
-                # --- 4. 处理因官掩码 (Causal Masking) ---
+                print(S_ij, sm_scale)
+                # 2. 修正：因果掩码必须使用全局索引
                 if is_causal:
-                    # 创建局部掩码：行索引必须 >= 列索引
-                    # 需要考虑全局索引：行 idx_i = start_i + row, 列 idx_j = start_j + col
                     rows = torch.arange(start_i, end_i, device=q.device).view(-1, 1)
                     cols = torch.arange(start_j, end_j, device=q.device).view(1, -1)
-                    mask = rows >= cols
-                    S_ij = S_ij.masked_fill(~mask, float('-inf'))
+                    S_ij = S_ij.masked_fill(rows < cols, -1e9)
 
-                # --- 5. Flash Attention 在线 Softmax 更新逻辑 ---
+                # 计算当前块统计量 (B, Br, 1)
                 m_ij, _ = torch.max(S_ij, dim=-1, keepdim=True)
                 P_ij = torch.exp(S_ij - m_ij)
                 l_ij = torch.sum(P_ij, dim=-1, keepdim=True)
 
-                # 更新统计量
-                m_new = torch.max(mi, m_ij)
-                # 利用公式进行重标定更新
-                li_new = torch.exp(mi - m_new) * li + torch.exp(m_ij - m_new) * l_ij
+                # --- 3. 核心修正：在线 Softmax 更新公式 ---
+                m_new = torch.maximum(mi, m_ij)
 
-                # 更新输出 Oi
-                # Oi = (Oi * exp(mi - m_new) * li + exp(m_ij - m_new) * P_ij * Vj) / li_new
-                term1 = (torch.exp(mi - m_new) * li) * oi
-                term2 = torch.exp(m_ij - m_new) * torch.matmul(P_ij, vj)
-                oi = (term1 + term2) / li_new
+                # 计算重标定因子
+                alpha = torch.exp(mi - m_new)
+                beta = torch.exp(m_ij - m_new)
 
-                # 写回
-                O[:, start_i:end_i, :] = oi
+                li_new = alpha * li + beta * l_ij
+
+                term1 = (alpha * li) * oi
+                term2 = beta * torch.matmul(P_ij, vj)
+                oi_new = (term1 + term2) / li_new
+
+                # 写回全局
+                O[:, start_i:end_i, :] = oi_new
                 m[:, start_i:end_i, :] = m_new
                 L[:, start_i:end_i, :] = li_new
 
-        # 保存上下文供反向传播
-        ctx.save_for_backward(q, k, v, O, m, L)
+        # --- 4. 关键修正：满足测试脚本对 saved_tensors 的断言 ---
+        # 测试脚本要求找到且仅找到一个形状为 (B, N) 的 tensor
+        lse = m + torch.log(L)
+
+        # 必须执行 .squeeze(-1) 否则形状是 (B, N, 1)，测试会报错 found 0 或者形状不匹配
+        ctx.save_for_backward(q, k, v, O, lse.squeeze(-1))
+
         ctx.is_causal = is_causal
+        ctx.sm_scale = sm_scale
 
         return O
 
     @staticmethod
     def backward(ctx, grad_output):
-
-        q, k, v, O, m, L = ctx.saved_tensors
+        # 1. 获取正向传播保存的张量
+        # 注意：根据之前的修正，这里存的是 q, k, v, O, lse (B, N)
+        q, k, v, O, lse = ctx.saved_tensors
         sm_scale = ctx.sm_scale
-        B, H, N, D = q.shape
+        is_causal = ctx.is_causal
+        B, N, D = q.shape
 
-        # 2. 预计算辅助梯度项 D = rowsum(grad_output * O)
-        Di = torch.sum(grad_output * O, dim=-1, keepdim=True)
+        # 将 lse 展回 (B, N, 1) 方便广播计算
+        lse = lse.unsqueeze(-1)
+
+        # 2. 预计算辅助梯度项 Di = rowsum(grad_output * O)
+        Di = torch.sum(grad_output * O, dim=-1, keepdim=True)  # (B, N, 1)
 
         dq = torch.zeros_like(q)
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
 
+        # 分块大小（通常反向传播也会采用分块以节省显存）
         Br, Bc = 64, 64
+        Tr, Tc = (N + Br - 1) // Br, (N + Bc - 1) // Bc
 
-        # 3. 反向传播分块循环 (O(N) 逻辑)
-        for i in range(0, N, Br):
-            qi = q[:, :, i:i + Br, :]
-            dOi = grad_output[:, :, i:i + Br, :]
-            mi = m[:, :, i:i + Br, :]
-            Li = L[:, :, i:i + Br, :]
-            Di_row = Di[:, :, i:i + Br, :]
+        # 外层循环遍历 Key/Value 块 (j)
+        for j in range(Tc):
+            start_j, end_j = j * Bc, min((j + 1) * Bc, N)
+            kj = k[:, start_j:end_j, :]
+            vj = v[:, start_j:end_j, :]
+            dkj = torch.zeros_like(kj)
+            dvj = torch.zeros_like(vj)
 
-            dqi = torch.zeros_like(qi)
+            # 内层循环遍历 Query 块 (i)
+            for i in range(Tr):
+                start_i, end_i = i * Br, min((i + 1) * Br, N)
 
-            for j in range(0, N, Bc):
-                kj = k[:, :, j:j + Bc, :]
-                vj = v[:, :, j:j + Bc, :]
+                # 因果掩码剪枝
+                if is_causal and (start_j > end_i - 1):
+                    continue
 
-                # 重计算局部 Softmax 概率
-                score = (qi @ kj.transpose(-2, -1)) * sm_scale
-                p_ij = torch.exp(score - mi) / Li
+                qi = q[:, start_i:end_i, :]
+                dO_i = grad_output[:, start_i:end_i, :]
+                LSE_i = lse[:, start_i:end_i, :]
+                Di_i = Di[:, start_i:end_i, :]
 
-                # 计算梯度累加
-                dv[:, :, j:j + Bc, :] += p_ij.transpose(-2, -1) @ dOi
-                dp_ij = dOi @ vj.transpose(-2, -1)
-                ds_ij = p_ij * (dp_ij - Di_row) * sm_scale
+                # --- 重新计算 S_ij 并应用掩码 ---
+                S_ij = torch.matmul(qi, kj.transpose(-2, -1)) * sm_scale
+                if is_causal:
+                    rows = torch.arange(start_i, end_i, device=q.device).view(-1, 1)
+                    cols = torch.arange(start_j, end_j, device=q.device).view(1, -1)
+                    S_ij = S_ij.masked_fill(rows < cols, float('-inf'))
 
-                dqi += ds_ij @ kj
-                dk[:, :, j:j + Bc, :] += ds_ij.transpose(-2, -1) @ qi
+                # --- 计算 P_ij (利用正向传播的 LSE 保证数值稳定) ---
+                P_ij = torch.exp(S_ij - LSE_i)  # (B, Br, Bc)
 
-            dq[:, :, i:i + Br, :] = dqi
+                # --- 计算各部分梯度 ---
+                # 1. dvj
+                dvj += torch.matmul(P_ij.transpose(-2, -1), dO_i)
 
-        # 返回值必须对应 forward 的输入 q, k, v
-        return dq, dk, dv
+                # 2. dP_ij 和 dS_ij
+                dP_ij = torch.matmul(dO_i, vj.transpose(-2, -1))
+                dS_ij = P_ij * (dP_ij - Di_i)  # (B, Br, Bc)
+
+                # 3. dqi 和 dkj
+                # 注意需要乘上 sm_scale
+                dq[:, start_i:end_i, :] += torch.matmul(dS_ij, kj) * sm_scale
+                dkj += torch.matmul(dS_ij.transpose(-2, -1), qi) * sm_scale
+
+            # 写回全局梯度
+            dk[:, start_j:end_j, :] = dkj
+            dv[:, start_j:end_j, :] = dvj
+
+        # 返回值必须匹配 forward 的参数个数: q, k, v, sm_scale, is_causal
+        # 因为 sm_scale 和 is_causal 不需要梯度，返回 None
+        return dq, dk, dv, None, None
